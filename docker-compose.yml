@@ -1,0 +1,258 @@
+name: telemetry
+
+# Data collection + analysis stack: Node-RED -> InfluxDB 2.x -> Grafana
+# Usage:  copy .env.example to .env, edit the secrets, then:  docker compose up -d --build
+# Status: docker compose ps   (all services should become "healthy")
+# Entry point: http://<host>/grafana/  /nodered/  /influx/  (nginx gateway; the other services publish no ports)
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  influxdb:
+    image: influxdb:${INFLUXDB_TAG:-2.7}
+    container_name: influxdb
+    restart: unless-stopped
+    # No published ports: reachable only on the backend network (and via the nginx gateway at /influx/).
+    environment:
+      TZ: ${TZ:-Europe/Warsaw}
+      # First-start provisioning only; ignored once the data volume is initialised.
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUX_ADMIN_USER:-admin}
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUX_ADMIN_PASSWORD:?set INFLUX_ADMIN_PASSWORD in .env}
+      DOCKER_INFLUXDB_INIT_ORG: ${INFLUX_ORG:-myorg}
+      DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUX_BUCKET:-telemetry}
+      DOCKER_INFLUXDB_INIT_RETENTION: ${INFLUX_RETENTION:-0}   # 0 = keep forever, e.g. 90d
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUX_TOKEN:?set INFLUX_TOKEN in .env}
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+      - influxdb-config:/etc/influxdb2
+    healthcheck:
+      test: ["CMD", "influx", "ping", "--host", "http://127.0.0.1:8086"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks: [backend]
+    logging: *default-logging
+
+  nodered:
+    build:
+      context: .
+      # Custom image so the Modbus and InfluxDB nodes are baked in (reproducible, no palette installs at runtime).
+      dockerfile_inline: |
+        ARG NODERED_TAG=latest-22
+        FROM nodered/node-red:$${NODERED_TAG}
+        RUN npm install --no-audit --no-fund --omit=dev \
+              node-red-contrib-modbus \
+              node-red-contrib-influxdb
+        # Starter flow, copied into the /data volume on its FIRST start only
+        # (an existing volume is never overwritten, so your edits are safe).
+        COPY --chown=node-red:root nodered/flows.json /data/flows.json
+        # Credentials stub: the token is a $(ENV) reference resolved at runtime, never the secret itself.
+        # Node-RED encrypts this file with NODE_RED_CREDENTIAL_SECRET on the first deploy.
+        RUN printf '{"influx_cfg":{"token":"$$(INFLUX_TOKEN)"}}' > /data/flows_cred.json
+      args:
+        NODERED_TAG: ${NODERED_TAG:-latest-22}
+    image: local/nodered-modbus-influx:${NODERED_TAG:-latest-22}
+    container_name: nodered
+    restart: unless-stopped
+    # No published ports: reachable only via the nginx gateway at /nodered/.
+    environment:
+      TZ: ${TZ:-Europe/Warsaw}
+      # Reference these in node configs as $(INFLUX_TOKEN), $(INFLUX_ORG), $(INFLUX_BUCKET)
+      INFLUX_URL: http://influxdb:8086
+      INFLUX_TOKEN: ${INFLUX_TOKEN}
+      INFLUX_ORG: ${INFLUX_ORG:-myorg}
+      INFLUX_BUCKET: ${INFLUX_BUCKET:-telemetry}
+      # Editor login + credential encryption (used by nodered/settings.js)
+      NODE_RED_ADMIN_USER: ${NODE_RED_ADMIN_USER:-admin}
+      NODE_RED_ADMIN_PASSWORD: ${NODE_RED_ADMIN_PASSWORD:?set NODE_RED_ADMIN_PASSWORD in .env}
+      NODE_RED_CREDENTIAL_SECRET: ${NODE_RED_CREDENTIAL_SECRET:?set NODE_RED_CREDENTIAL_SECRET in .env}
+      # Used by the starter flow
+      MODBUS_HOST: ${MODBUS_HOST:-192.168.1.100}
+      DEVICE_NAME: ${DEVICE_NAME:-plc1}
+    volumes:
+      - nodered-data:/data
+    configs:
+      - source: nodered_settings
+        target: /data/settings.js
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    healthcheck:
+      # The image ships Node but not curl/wget, so probe with Node itself.
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('http').get('http://127.0.0.1:1880/nodered/',r=>process.exit(r.statusCode<400?0:1)).on('error',()=>process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    networks: [backend]
+    logging: *default-logging
+
+  grafana:
+    image: grafana/grafana-oss:${GRAFANA_TAG:-latest}
+    container_name: grafana
+    restart: unless-stopped
+    # No published ports: reachable only via the nginx gateway at /grafana/.
+    environment:
+      TZ: ${TZ:-Europe/Warsaw}
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      # Served under /grafana/ behind the nginx gateway
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost/grafana/}
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      # Consumed by the provisioned datasource below (expanded by Grafana at load time)
+      INFLUX_TOKEN: ${INFLUX_TOKEN}
+      INFLUX_ORG: ${INFLUX_ORG:-myorg}
+      INFLUX_BUCKET: ${INFLUX_BUCKET:-telemetry}
+    volumes:
+      - grafana-data:/var/lib/grafana
+    configs:
+      - source: grafana_datasource
+        target: /etc/grafana/provisioning/datasources/influxdb.yaml
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks: [backend]
+    logging: *default-logging
+
+  nginx:
+    image: nginx:${NGINX_TAG:-alpine}
+    container_name: nginx
+    restart: unless-stopped
+    ports:
+      # The only published port. Set GATEWAY_BIND=127.0.0.1 in .env to keep it local.
+      - "${GATEWAY_BIND:-0.0.0.0}:${GATEWAY_PORT:-80}:80"
+    environment:
+      TZ: ${TZ:-Europe/Warsaw}
+    configs:
+      - source: nginx_conf
+        target: /etc/nginx/conf.d/default.conf
+    depends_on:
+      influxdb:
+        condition: service_healthy
+      nodered:
+        condition: service_healthy
+      grafana:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks: [backend]
+    logging: *default-logging
+
+configs:
+  nginx_conf:
+    # $$ is escaped for Compose; nginx sees a single $.
+    content: |
+      map $$http_upgrade $$connection_upgrade {
+        default upgrade;
+        ""      close;
+      }
+
+      server {
+        listen 80;
+        server_name _;
+
+        proxy_http_version 1.1;
+        proxy_set_header Host              $$http_host;
+        proxy_set_header X-Real-IP         $$remote_addr;
+        proxy_set_header X-Forwarded-For   $$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $$scheme;
+        proxy_set_header Upgrade           $$http_upgrade;
+        proxy_set_header Connection        $$connection_upgrade;
+        proxy_read_timeout 300s;
+        client_max_body_size 50m;
+
+        location = /healthz { access_log off; return 200 "ok"; }
+        location = /        { return 302 /grafana/; }
+
+        # Grafana (serve_from_sub_path: it expects the prefix, so nothing is stripped)
+        location = /grafana { return 301 /grafana/; }
+        location /grafana/ {
+          proxy_pass http://grafana:3000;
+        }
+
+        # Node-RED (httpAdminRoot=/nodered in settings.js; the editor websocket is /nodered/comms)
+        location = /nodered { return 301 /nodered/; }
+        location /nodered/ {
+          proxy_pass http://nodered:1880;
+        }
+
+        # The Influx UI's webpack publicPath is "/", so lazy-loaded chunks and assets are requested
+        # from the root (e.g. /65cda92f53.js). Hashed root-level files are served by InfluxDB.
+        location ~ "^/[0-9a-f]{8,}.+(js|css|wasm|woff2?|ttf|eot|svg|png|jpg|map)$$" {
+          proxy_pass http://influxdb:8086;
+        }
+
+        # The UI also calls its API at the root (/api/v2/...), ignoring the base path.
+        location = /health { proxy_pass http://influxdb:8086; }
+        location ^~ /api/ {
+          proxy_pass http://influxdb:8086;
+        }
+
+        # InfluxDB 2.x has no base-path option: strip the prefix and rewrite the UI's absolute paths.
+        location = /influx { return 301 /influx/; }
+        location /influx/ {
+          rewrite ^/influx/(.*)$$ /$$1 break;
+          proxy_pass http://influxdb:8086;
+          proxy_redirect / /influx/;
+          proxy_set_header Accept-Encoding "";   # sub_filter needs an uncompressed body
+          sub_filter_once off;
+          sub_filter '<base href="/">'            '<base href="/influx/">';
+          sub_filter 'data-basepath=""'           'data-basepath="/influx"';
+          sub_filter 'src="/'                     'src="/influx/';
+          sub_filter 'href="/favicon'             'href="/influx/favicon';
+        }
+      }
+
+  nodered_settings:
+    file: ./nodered/settings.js
+  grafana_datasource:
+    # $$ is escaped for Compose; Grafana expands ${VAR} from its own environment.
+    content: |
+      apiVersion: 1
+      datasources:
+        - name: InfluxDB
+          uid: influxdb-main
+          type: influxdb
+          access: proxy
+          url: http://influxdb:8086
+          isDefault: true
+          jsonData:
+            version: Flux
+            organization: $${INFLUX_ORG}
+            defaultBucket: $${INFLUX_BUCKET}
+            tlsSkipVerify: true
+          secureJsonData:
+            token: $${INFLUX_TOKEN}
+
+volumes:
+  influxdb-data:
+  influxdb-config:
+  nodered-data:
+  grafana-data:
+
+networks:
+  backend:
+    driver: bridge
