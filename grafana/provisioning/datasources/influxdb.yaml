@@ -1,0 +1,16 @@
+# The placeholders below are expanded by Grafana from its own environment (set in docker-compose.yml).
+apiVersion: 1
+datasources:
+  - name: InfluxDB
+    uid: influxdb-main
+    type: influxdb
+    access: proxy
+    url: http://influxdb:8086
+    isDefault: true
+    jsonData:
+      version: Flux
+      organization: ${INFLUX_ORG}
+      defaultBucket: ${INFLUX_BUCKET}
+      tlsSkipVerify: true
+    secureJsonData:
+      token: ${INFLUX_TOKEN}

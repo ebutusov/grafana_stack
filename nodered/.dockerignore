@@ -1,0 +1,3 @@
+# Only flows.json is needed by the Dockerfile; settings.js is mounted at runtime via Compose configs.
+*
+!flows.json

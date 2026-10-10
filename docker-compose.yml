@@ -45,20 +45,8 @@ services:
 
   nodered:
     build:
-      context: .
-      # Custom image so the Modbus and InfluxDB nodes are baked in (reproducible, no palette installs at runtime).
-      dockerfile_inline: |
-        ARG NODERED_TAG=latest-22
-        FROM nodered/node-red:$${NODERED_TAG}
-        RUN npm install --no-audit --no-fund --omit=dev \
-              node-red-contrib-modbus \
-              node-red-contrib-influxdb
-        # Starter flow, copied into the /data volume on its FIRST start only
-        # (an existing volume is never overwritten, so your edits are safe).
-        COPY --chown=node-red:root nodered/flows.json /data/flows.json
-        # Credentials stub: the token is a $(ENV) reference resolved at runtime, never the secret itself.
-        # Node-RED encrypts this file with NODE_RED_CREDENTIAL_SECRET on the first deploy.
-        RUN printf '{"influx_cfg":{"token":"$$(INFLUX_TOKEN)"}}' > /data/flows_cred.json
+      # Custom image with the Modbus and InfluxDB nodes baked in (see nodered/Dockerfile).
+      context: ./nodered
       args:
         NODERED_TAG: ${NODERED_TAG:-latest-22}
     image: local/nodered-modbus-influx:${NODERED_TAG:-latest-22}
@@ -164,67 +152,13 @@ services:
     logging: *default-logging
 
 configs:
+  # Mounted as plain files: Compose does not interpolate their contents, so no $$ escaping is needed.
   nginx_conf:
-    # $$ is escaped for Compose; nginx sees a single $.
-    content: |
-      map $$http_upgrade $$connection_upgrade {
-        default upgrade;
-        ""      close;
-      }
-
-      server {
-        listen 80;
-        server_name _;
-
-        proxy_http_version 1.1;
-        proxy_set_header Host              $$http_host;
-        proxy_set_header X-Real-IP         $$remote_addr;
-        proxy_set_header X-Forwarded-For   $$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $$scheme;
-        proxy_set_header Upgrade           $$http_upgrade;
-        proxy_set_header Connection        $$connection_upgrade;
-        proxy_read_timeout 300s;
-        client_max_body_size 50m;
-
-        location = /healthz { access_log off; return 200 "ok"; }
-        location = /        { return 302 /grafana/; }
-
-        # Grafana (serve_from_sub_path: it expects the prefix, so nothing is stripped)
-        location = /grafana { return 301 /grafana/; }
-        location /grafana/ {
-          proxy_pass http://grafana:3000;
-        }
-
-        # Node-RED (httpAdminRoot=/nodered in settings.js; the editor websocket is /nodered/comms)
-        location = /nodered { return 301 /nodered/; }
-        location /nodered/ {
-          proxy_pass http://nodered:1880;
-        }
-
-        # InfluxDB is deliberately not proxied: it has no base-path option, and serving its UI under a
-        # prefix would require claiming root-level paths (/api/, hashed assets). See the influxdb service.
-      }
-
+    file: ./nginx/default.conf
   nodered_settings:
     file: ./nodered/settings.js
   grafana_datasource:
-    # $$ is escaped for Compose; Grafana expands ${VAR} from its own environment.
-    content: |
-      apiVersion: 1
-      datasources:
-        - name: InfluxDB
-          uid: influxdb-main
-          type: influxdb
-          access: proxy
-          url: http://influxdb:8086
-          isDefault: true
-          jsonData:
-            version: Flux
-            organization: $${INFLUX_ORG}
-            defaultBucket: $${INFLUX_BUCKET}
-            tlsSkipVerify: true
-          secureJsonData:
-            token: $${INFLUX_TOKEN}
+    file: ./grafana/provisioning/datasources/influxdb.yaml
 
 volumes:
   influxdb-data:

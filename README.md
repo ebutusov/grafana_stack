@@ -28,8 +28,10 @@ Set `MODBUS_HOST` in `.env` to the device you want to poll. Set `GATEWAY_BIND=12
 
 ## What's included
 
-- `docker-compose.yml`: the stack, with the Node-RED image built inline and the nginx config embedded.
-- `nodered/`: `settings.js` (admin auth) and a starter flow that reads Modbus registers, validates and scales them, and writes them to InfluxDB. It also writes error events and a 60 s heartbeat so Grafana can alert if the collector goes silent.
+- `docker-compose.yml`: the stack.
+- `nginx/default.conf`: the gateway config.
+- `grafana/provisioning/`: the provisioned InfluxDB datasource.
+- `nodered/`: `Dockerfile` (bakes in the Modbus and InfluxDB nodes), `settings.js` (admin auth) and a starter flow that reads Modbus registers, validates and scales them, and writes them to InfluxDB. It also writes error events and a 60 s heartbeat so Grafana can alert if the collector goes silent.
 - `.env.example`: configuration template. `.env` holds your real secrets and is git-ignored.
 
 Grafana's datasource is provisioned automatically. Dashboards and alert rules are not provisioned; create them in Grafana or through its API.
