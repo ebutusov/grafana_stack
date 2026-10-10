@@ -3,7 +3,8 @@ name: telemetry
 # Data collection + analysis stack: Node-RED -> InfluxDB 2.x -> Grafana
 # Usage:  copy .env.example to .env, edit the secrets, then:  docker compose up -d --build
 # Status: docker compose ps   (all services should become "healthy")
-# Entry point: http://<host>/grafana/  /nodered/  /influx/  (nginx gateway; the other services publish no ports)
+# Entry point: http://<host>/grafana/  /nodered/  (nginx gateway)
+# InfluxDB UI: http://localhost:8086 on the Docker host only (remote: ssh -L 8086:localhost:8086 <host>)
 
 x-logging: &default-logging
   driver: json-file
@@ -16,7 +17,10 @@ services:
     image: influxdb:${INFLUXDB_TAG:-2.7}
     container_name: influxdb
     restart: unless-stopped
-    # No published ports: reachable only on the backend network (and via the nginx gateway at /influx/).
+    # Not behind the gateway (InfluxDB 2.x has no base-path option). Published on loopback only,
+    # for the UI and CLI on the Docker host or through an SSH tunnel.
+    ports:
+      - "127.0.0.1:${INFLUX_UI_PORT:-8086}:8086"
     environment:
       TZ: ${TZ:-Europe/Warsaw}
       # First-start provisioning only; ignored once the data volume is initialised.
@@ -146,8 +150,6 @@ services:
       - source: nginx_conf
         target: /etc/nginx/conf.d/default.conf
     depends_on:
-      influxdb:
-        condition: service_healthy
       nodered:
         condition: service_healthy
       grafana:
@@ -199,31 +201,8 @@ configs:
           proxy_pass http://nodered:1880;
         }
 
-        # The Influx UI's webpack publicPath is "/", so lazy-loaded chunks and assets are requested
-        # from the root (e.g. /65cda92f53.js). Hashed root-level files are served by InfluxDB.
-        location ~ "^/[0-9a-f]{8,}.+(js|css|wasm|woff2?|ttf|eot|svg|png|jpg|map)$$" {
-          proxy_pass http://influxdb:8086;
-        }
-
-        # The UI also calls its API at the root (/api/v2/...), ignoring the base path.
-        location = /health { proxy_pass http://influxdb:8086; }
-        location ^~ /api/ {
-          proxy_pass http://influxdb:8086;
-        }
-
-        # InfluxDB 2.x has no base-path option: strip the prefix and rewrite the UI's absolute paths.
-        location = /influx { return 301 /influx/; }
-        location /influx/ {
-          rewrite ^/influx/(.*)$$ /$$1 break;
-          proxy_pass http://influxdb:8086;
-          proxy_redirect / /influx/;
-          proxy_set_header Accept-Encoding "";   # sub_filter needs an uncompressed body
-          sub_filter_once off;
-          sub_filter '<base href="/">'            '<base href="/influx/">';
-          sub_filter 'data-basepath=""'           'data-basepath="/influx"';
-          sub_filter 'src="/'                     'src="/influx/';
-          sub_filter 'href="/favicon'             'href="/influx/favicon';
-        }
+        # InfluxDB is deliberately not proxied: it has no base-path option, and serving its UI under a
+        # prefix would require claiming root-level paths (/api/, hashed assets). See the influxdb service.
       }
 
   nodered_settings:

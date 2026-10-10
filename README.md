@@ -6,13 +6,15 @@ A Docker Compose telemetry stack: **Node-RED** polls a device over Modbus/TCP, w
 Modbus/TCP device → Node-RED → InfluxDB → Grafana
 ```
 
-All services sit behind an nginx gateway on a single port:
+Grafana and Node-RED sit behind an nginx gateway on a single port. InfluxDB is not proxied (it has no base-path option); its UI and API are published on the Docker host's loopback interface only:
 
 | URL | Service |
 | --- | --- |
-| `http://localhost/grafana/` | Grafana |
-| `http://localhost/nodered/` | Node-RED |
-| `http://localhost/influx/` | InfluxDB UI |
+| `http://<host>/grafana/` | Grafana |
+| `http://<host>/nodered/` | Node-RED |
+| `http://localhost:8086/` | InfluxDB UI (Docker host only) |
+
+To reach the InfluxDB UI from another machine, tunnel it: `ssh -L 8086:localhost:8086 <host>`, then open `http://localhost:8086/`. Day-to-day admin (tokens, buckets, backups) also works through the CLI, e.g. `docker compose exec influxdb influx bucket list`.
 
 ## Quick start
 
